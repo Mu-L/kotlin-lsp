@@ -6,7 +6,6 @@ import com.intellij.openapi.application.PathManager
 import com.intellij.openapi.components.ExpandMacroToPathMap
 import com.intellij.openapi.components.impl.getAllMacros
 import com.intellij.openapi.diagnostic.fileLogger
-import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.projectRoots.JavaSdk
 import com.intellij.openapi.projectRoots.impl.JavaHomeFinder
@@ -56,10 +55,14 @@ import com.jetbrains.ls.imports.json.flattenExportedDependencies
 import com.jetbrains.ls.imports.maven.MavenWorkspaceImporter
 import com.jetbrains.ls.imports.utils.toIntellijUri
 import com.jetbrains.ls.snapshot.api.impl.core.toFileUrl
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.buildJsonObject
@@ -69,6 +72,7 @@ import org.jdom.Element
 import org.jetbrains.idea.maven.aether.ArtifactKind
 import org.jetbrains.idea.maven.aether.ArtifactRepositoryManager
 import org.jetbrains.idea.maven.aether.ProgressConsumer
+import org.jetbrains.idea.maven.aether.RetryProvider
 import org.jetbrains.jps.model.JpsElementFactory
 import org.jetbrains.jps.model.JpsModel
 import org.jetbrains.jps.model.java.JavaResourceRootType
@@ -104,6 +108,7 @@ import org.jetbrains.kotlin.idea.workspaceModel.toCompilerSettingsData
 import org.jetbrains.kotlin.jps.model.JpsKotlinFacetModuleExtension
 import java.io.IOException
 import java.nio.file.Path
+import java.time.Duration
 import kotlin.io.path.absolutePathString
 import kotlin.io.path.div
 import kotlin.io.path.exists
@@ -111,6 +116,8 @@ import kotlin.io.path.isDirectory
 import kotlin.io.path.isRegularFile
 
 private val LOG = fileLogger()
+
+private const val DOWNLOAD_PARALLELISM = 16
 
 object JpsWorkspaceImporter : WorkspaceImporter, ConflictAverseImporter {
     /**
@@ -180,7 +187,7 @@ object JpsWorkspaceImporter : WorkspaceImporter, ConflictAverseImporter {
         }
     }.buffer(Channel.UNLIMITED)
 
-    private fun importJpsModel(
+    private suspend fun importJpsModel(
         storage: MutableEntityStorage,
         projectDirectory: Path,
         virtualFileUrlManager: VirtualFileUrlManager,
@@ -192,9 +199,7 @@ object JpsWorkspaceImporter : WorkspaceImporter, ConflictAverseImporter {
         val entitySource = WorkspaceEntitySource(projectDirectory.toIntellijUri(virtualFileUrlManager))
         val libs = mutableSetOf<String>()
         val sdks = mutableSetOf<String>()
-        // Lazily created so the resolver (and its remote-repository setup) is only initialized when a library actually
-        // needs to be downloaded.
-        val repositoryManager = lazy { createArtifactRepositoryManager(projectDirectory) }
+        downloadMissingLibraries(model, projectDirectory, options)
 
         model.project.modules.forEach { module ->
             val kotlinFacetModuleExtension = module.container.getChild(JpsKotlinFacetModuleExtension.KIND)
@@ -206,7 +211,7 @@ object JpsWorkspaceImporter : WorkspaceImporter, ConflictAverseImporter {
                         val library = dependency.library ?: return@mapNotNull null
                         if (libs.add(library.name)) {
                             val roots =
-                                resolveLibraryRoots(library, virtualFileUrlManager, onUnresolvedDependency, repositoryManager, options)
+                                resolveLibraryRoots(library, virtualFileUrlManager, onUnresolvedDependency)
                                 ?: return@mapNotNull null
                             val libEntity = LibraryEntity(
                                 name = library.name,
@@ -466,15 +471,12 @@ private fun JpsLibraryType<*>.toSdkType(): String = when (this) {
 }
 
 /**
- * Builds the workspace-model roots for [library].
+ * Downloads the Maven repository libraries whose compiled roots are missing on disk (e.g. the artifact was never
+ * downloaded into the local Maven repository).
  *
- * When some compiled roots are missing on disk (e.g. the artifact was never downloaded into the local Maven repository)
- * and the library is a Maven repository library, the artifact together with its transitive dependencies is resolved and
- * downloaded into the local Maven repository via [repositoryManager]. The downloaded files land at the macro-expanded
- * paths the JPS roots already point to, so afterwards the roots are taken as serialized in the JPS model.
- *
- * Returns `null` when some compiled root still cannot be resolved, in which case the caller skips the dependency and the
- * missing roots are reported as unresolved.
+ * Each artifact is resolved together with its transitive dependencies, and the libraries are resolved in parallel.
+ * The downloaded files land at the macro-expanded paths the JPS roots already point to, so afterwards the roots are
+ * taken as serialized in the JPS model.
  *
  * With [WorkspaceImportOptions.offline] the download is skipped, so a missing artifact stays unresolved. With
  * [WorkspaceImportOptions.downloadAdditionalArtifacts] the same download also asks for the `sources` classifier.
@@ -483,24 +485,50 @@ private fun JpsLibraryType<*>.toSdkType(): String = when (this) {
  * A missing sources root alone never starts a download: only a missing compiled root does, and the sources travel
  * with it.
  */
+private suspend fun downloadMissingLibraries(
+    model: JpsModel,
+    projectDirectory: Path,
+    options: WorkspaceImportOptions,
+) {
+    if (options.offline) return
+    val descriptors = model.project.modules
+        .asSequence()
+        .flatMap { it.dependenciesList.dependencies }
+        .filterIsInstance<JpsLibraryDependency>()
+        .mapNotNull { it.library }
+        .distinctBy { it.name }
+        .filter { library -> library.getRootUrls(JpsOrderRootType.COMPILED).any { !Path.of(JpsPathUtil.urlToPath(it)).exists() } }
+        .mapNotNull { it.mavenRepositoryDescriptor() }
+        .distinctBy { listOf(it.mavenId, it.isIncludeTransitiveDependencies, it.excludedDependencies) }
+        .toList()
+    if (descriptors.isEmpty()) return
+
+    val repositoryManager = createArtifactRepositoryManager(projectDirectory)
+    val kinds =
+        if (options.downloadAdditionalArtifacts) setOf(ArtifactKind.ARTIFACT, ArtifactKind.SOURCES)
+        else setOf(ArtifactKind.ARTIFACT)
+    val dispatcher = Dispatchers.IO.limitedParallelism(DOWNLOAD_PARALLELISM)
+    coroutineScope {
+        descriptors.forEach { descriptor ->
+            launch(dispatcher) {
+                downloadFromMavenRepository(repositoryManager, descriptor, kinds)
+            }
+        }
+    }
+}
+
+/**
+ * Builds the workspace-model roots for [library].
+ *
+ * Returns `null` when some compiled root cannot be resolved, in which case the caller skips the dependency and the
+ * missing roots are reported as unresolved. [downloadMissingLibraries] downloads the missing artifacts beforehand.
+ */
 private fun resolveLibraryRoots(
     library: JpsLibrary,
     virtualFileUrlManager: VirtualFileUrlManager,
     onUnresolvedDependency: (String) -> Unit,
-    repositoryManager: Lazy<ArtifactRepositoryManager>,
-    options: WorkspaceImportOptions,
 ): List<LibraryRoot>? {
     val compiledUrls = library.getRootUrls(JpsOrderRootType.COMPILED)
-
-    if (!options.offline && compiledUrls.any { !Path.of(JpsPathUtil.urlToPath(it)).exists() }) {
-        library.mavenRepositoryDescriptor()?.let { descriptor ->
-            val kinds =
-                if (options.downloadAdditionalArtifacts) setOf(ArtifactKind.ARTIFACT, ArtifactKind.SOURCES)
-                else setOf(ArtifactKind.ARTIFACT)
-            downloadFromMavenRepository(repositoryManager.value, descriptor, kinds)
-        }
-    }
-
     val missingCompiled = compiledUrls.filter { !Path.of(JpsPathUtil.urlToPath(it)).exists() }
     if (missingCompiled.isNotEmpty()) {
         missingCompiled.forEach(onUnresolvedDependency)
@@ -542,7 +570,7 @@ private fun downloadFromMavenRepository(
             descriptor.excludedDependencies,
         )
     }
-    catch (e: ProcessCanceledException) {
+    catch (e: CancellationException) {
         throw e
     }
     catch (e: Exception) {
@@ -566,6 +594,11 @@ private fun createArtifactRepositoryManager(projectDirectory: Path): ArtifactRep
         Path.of(JpsMavenSettings.getMavenRepositoryPath()).toFile(),
         remoteRepositories,
         ProgressConsumer.DEAF,
+        false,
+        RetryProvider.disabled(),
+        // Parallel resolutions block on shared named locks while an overlapping dependency graph downloads.
+        // The default 30-second lock timeout aborts such a wait, so give a slow download a generous margin.
+        Duration.ofMinutes(15),
     )
 }
 
@@ -583,15 +616,19 @@ private fun createArtifactRepositoryManager(projectDirectory: Path): ArtifactRep
  * </component>
  * ```
  *
- * The repository `id` matters because the Aether resolver matches it against authentication and mirror settings from
- * `.m2/settings.xml`. Returns `null` when the file is absent or declares no usable repositories, so the caller falls
- * back to the default remote repositories.
+ * The repository `id` selects the credentials: a `<server>` entry with the same id in Maven's `settings.xml` supplies
+ * the username and the password. Returns `null` when the file is absent or declares no usable repositories, so the
+ * caller falls back to the default remote repositories.
  */
 private fun readRemoteRepositories(projectDirectory: Path): List<RemoteRepository>? {
     val root = loadIdeaXml(projectDirectory, "jarRepositories.xml") ?: return null
     val component = root.children
         .firstOrNull { it.name == "component" && it.getAttributeValue("name") == "RemoteRepositoriesConfiguration" }
         ?: return null
+    val authentication = JpsMavenSettings.loadAuthenticationSettings(
+        JpsMavenSettings.getGlobalMavenSettingsXml(),
+        JpsMavenSettings.getUserMavenSettingsXml(),
+    )
     return component.children
         .asSequence()
         .filter { it.name == "remote-repository" }
@@ -601,7 +638,10 @@ private fun readRemoteRepositories(projectDirectory: Path): List<RemoteRepositor
                 options.firstOrNull { it.getAttributeValue("name") == name }?.getAttributeValue("value")
             val id = option("id") ?: return@mapNotNull null
             val url = option("url") ?: return@mapNotNull null
-            ArtifactRepositoryManager.createRemoteRepository(id, url)
+            val authenticationData = authentication[id]?.let {
+                ArtifactRepositoryManager.ArtifactAuthenticationData(it.username, it.password)
+            }
+            ArtifactRepositoryManager.createRemoteRepository(id, url, authenticationData)
         }
         .toList()
         .nullize()
