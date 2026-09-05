@@ -45,7 +45,9 @@ import com.jetbrains.lsp.protocol.TextDocumentEdit
 import com.jetbrains.lsp.protocol.WorkspaceEdit
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import org.jetbrains.annotations.ApiStatus
 import org.jetbrains.annotations.Nls
+import org.jetbrains.annotations.TestOnly
 import org.jetbrains.kotlin.analysis.api.permissions.KaAllowAnalysisFromWriteAction
 import org.jetbrains.kotlin.analysis.api.permissions.KaAllowAnalysisOnEdt
 import org.jetbrains.kotlin.analysis.api.permissions.allowAnalysisFromWriteAction
@@ -214,18 +216,58 @@ private class LSKotlinInlineVariableProcessor(
     private fun doPerformRefactoring(usages: Array<UsageInfo>) {
         if (usages.isNotEmpty()) {
             val replacementStrategy = processor.createReplacementStrategy() ?: return
+            val references = usages.mapNotNull { it.element as? KtReferenceExpression }
             replacementStrategy.replaceUsages(
-                usages = usages.mapNotNull { it.element as? KtReferenceExpression },
+                usages = if (LSKotlinInlineVariableTestHooks.skipFirstUsage) references.drop(1) else references,
                 unwrapSpecialUsages = true,
                 unwrapSpecialUsageOrNull = processor::unwrapSpecialUsage,
             )
         }
-        if (deleteDeclaration && declaration.isWritable) {
-            declaration.deleteWithCompanion()
-            processor.postDeleteAction()
+        if (declaration.isWritable) {
+            checkAllUsagesReplaced()
+            if (deleteDeclaration) {
+                declaration.deleteWithCompanion()
+                processor.postDeleteAction()
+            }
         }
         processor.postAction()
     }
 
+    /**
+     * [replaceUsages] logs and skips a failed usage; a removal of the declaration then breaks the code.
+     * The declaration goes away on both paths: the deletion here, and the `when`-subject
+     * replacement in [AbstractKotlinInlinePropertyProcessor.postAction].
+     * A write usage is not an inline failure: the removal deletes it together with the declaration.
+     */
+    private fun checkAllUsagesReplaced() {
+        val hasRemainingReadUsages = ReferencesSearchScopeHelper.search(declaration).anyMatch { reference ->
+            val expression = (reference.element as? KtExpression)?.getQualifiedExpressionForSelectorOrThis()
+            expression != null && expression.readWriteAccess(useResolveForReadWrite = true) == ReferenceAccess.READ
+        }
+        check(!hasRemainingReadUsages) {
+            LspServerBundle.message("error.inline.usages.not.replaced", declaration.name.toString())
+        }
+    }
+
     override fun createEventData(): RefactoringEventData = RefactoringEventData().apply { addElement(declaration) }
+}
+
+/**
+ * No plain Kotlin code makes [replaceUsages] fail deterministically.
+ * The hook simulates the failure: it skips the first usage the way [replaceUsages] skips a failed one.
+ */
+@ApiStatus.Internal
+object LSKotlinInlineVariableTestHooks {
+    @Volatile
+    internal var skipFirstUsage: Boolean = false
+
+    @TestOnly
+    fun <T> withFailedUsageReplacement(body: () -> T): T {
+        skipFirstUsage = true
+        try {
+            return body()
+        } finally {
+            skipFirstUsage = false
+        }
+    }
 }
