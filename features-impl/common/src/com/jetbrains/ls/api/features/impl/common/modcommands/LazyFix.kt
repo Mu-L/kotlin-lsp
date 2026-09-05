@@ -11,6 +11,8 @@ import com.intellij.openapi.application.readAction
 import com.intellij.openapi.diagnostic.getOrHandleException
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.openapi.vfs.VirtualFileManager
+import com.intellij.openapi.vfs.findPsiFile
 import com.jetbrains.ls.api.core.LSServer
 import com.jetbrains.ls.api.core.util.uri
 import com.jetbrains.ls.api.core.withAnalysisContextAndFileSettings
@@ -50,6 +52,21 @@ sealed class LazyFix(
     abstract fun perform(): ModCommandWithContext?
 
     /**
+     * [context] re-anchored in the current analysis context, or `null` when its file url no longer resolves.
+     *
+     * A fix can be performed in an analysis context other than the one that found it. The kept file is not
+     * valid there, so the file is resolved by its url again. Without this, the parts of the action that work
+     * on [ActionContext.file], such as the caret tracking, silently degrade.
+     */
+    protected fun currentContext(): ActionContext? {
+        val file = context.file
+        if (file.isValid) return context
+        val virtualFile = VirtualFileManager.getInstance().findFileByUrl(file.viewProvider.virtualFile.url) ?: return null
+        val psiFile = virtualFile.findPsiFile(context.project) ?: return null
+        return context.withFile(psiFile)
+    }
+
+    /**
      * A fix backed by a [ModCommandAction], which covers an intention, a compiler-error fix, and an inspection
      * fix that adapts to a [ModCommandAction].
      */
@@ -59,21 +76,22 @@ sealed class LazyFix(
         context: ActionContext,
     ) : LazyFix(context) {
         override fun perform(): ModCommandWithContext? {
+            val currentContext = currentContext() ?: return null
             // A null presentation means the same as `false` from IntentionAction#isAvailable, so it is how the
             // action reports that it does not apply anymore. A fix that was available when it was offered may
             // have become unavailable since.
             runCatching {
-                action.getPresentation(context)
+                action.getPresentation(currentContext)
             }.getOrHandleException {
                 LOG.warn("Failed to get presentation from mod command action $action", it)
             } ?: return null
 
             val command = runCatching {
-                action.perform(context)
+                action.perform(currentContext)
             }.getOrHandleException {
                 LOG.warn("Failed to perform mod command action $action", it)
             } ?: return null
-            return ModCommandWithContext(context, command)
+            return ModCommandWithContext(currentContext, command)
         }
 
         override fun toString(): String = "OfAction($action)"
