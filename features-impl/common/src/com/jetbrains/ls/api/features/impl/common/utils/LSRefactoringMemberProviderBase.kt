@@ -147,6 +147,13 @@ abstract class LSRefactoringMemberProviderBase<Context> : LSCodeActionProvider, 
                                         )
                                     }
                                 }
+
+                                if (applyResult.applied && result.message != null) {
+                                    lspClient.notify(
+                                        ShowMessageNotificationType,
+                                        ShowMessageParams(MessageType.Info, result.message),
+                                    )
+                                }
                             }
                         }
 
@@ -265,12 +272,16 @@ abstract class LSRefactoringMemberProviderBase<Context> : LSCodeActionProvider, 
     protected abstract suspend fun executeRefactoring(context: Context): RefactoringResult?
 
     /**
+     * @property changes the list of file changes that should be applied to the document
+     * @property navigationRange the range inside the file in which refactoring was invoked and to which the caret position should be navigated
+     * @property message notification message that should be displayed to the user after the refactoring is applied.
      * @property startRename when true, and the client declares `intellijExtensions`, the client is asked to
      *   start an inline rename at [navigationRange] after the edit is applied
      */
     data class RefactoringResult(
         val changes: List<FileChange>,
         val navigationRange: Range?,
+        val message: @Nls String? = null,
         val startRename: Boolean = false,
     ) {
         companion object {
